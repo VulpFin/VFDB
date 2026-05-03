@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.dll
+*.dylib
+.Python
+.wvenv/
+.venv/
+.venv-linux/
+.venv-win/
+venv/
+env/
+
+# Build and packaging outputs
+build/
+dist/
+*.egg-info/
+wheelhouse/
+winwheelhouse/
+linuxwheelhouse/
+testpypi/
+ttmp/
+temp/
+tmp/
+*.whl
+*.tar.gz
+*.zip
+*.log
+
+# Native compiler outputs
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.a
+
+# VFDB runtime data
+*.vfdb
+*.vfdb.meta
+*.vfheap
+python/test/
+
+# Test and coverage caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editor, OS, and local env
+.vscode/
+*.code-workspace
+.idea/
+.env
+.env.*
+!.env.example
+.lu
+Thumbs.db
+Desktop.ini

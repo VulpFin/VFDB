@@ -1,0 +1,45 @@
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "python"))
+
+import vfdb
+
+
+def run(db, sql):
+    return list(db.execute(sql))
+
+
+def test_crud_transactions_and_persistence(tmp_path):
+    db_path = tmp_path / "app.vfdb"
+
+    with vfdb.connect(str(db_path)) as db:
+        assert run(db, "SELECT 7;") == [(7,)]
+        assert run(db, "CREATE TABLE tasks(id INT, title TEXT);") == []
+        assert run(db, "PRAGMA tables;") == [("tasks",)]
+        assert run(db, "PRAGMA schema tasks;") == [("id", "INT"), ("title", "TEXT")]
+
+        run(db, "INSERT INTO tasks VALUES (1, 'write');")
+        db.exec("INSERT INTO tasks VALUES (?, ?);", [2, "ship"])
+        db.exec("INSERT INTO tasks VALUES (?, ?);", [3, "O'Brien"])
+        assert db.fetchall("SELECT * FROM tasks WHERE id = ?;", [2]) == [(2, "ship")]
+        assert db.fetchone("SELECT * FROM tasks WHERE title = ?;", ["O'Brien"]) == (3, "O'Brien")
+
+        run(db, "UPDATE tasks SET title='done' WHERE id = 2;")
+        assert run(db, "SELECT * FROM tasks WHERE id != 3;") == [(1, "write"), (2, "done")]
+
+        run(db, "BEGIN;")
+        run(db, "INSERT INTO tasks VALUES (3, 'tmp');")
+        run(db, "ROLLBACK;")
+        assert run(db, "SELECT * FROM tasks WHERE id != 3;") == [(1, "write"), (2, "done")]
+
+        run(db, "BEGIN;")
+        run(db, "DELETE FROM tasks WHERE id = 1;")
+        run(db, "COMMIT;")
+        assert run(db, "SELECT * FROM tasks WHERE id != 3;") == [(2, "done")]
+
+    with vfdb.connect(str(db_path)) as db:
+        assert run(db, "PRAGMA tables;") == [("tasks",)]
+        assert run(db, "SELECT * FROM tasks WHERE id != 3;") == [(2, "done")]
+        assert db.fetchone("SELECT * FROM tasks WHERE title = ?;", ["O'Brien"]) == (3, "O'Brien")

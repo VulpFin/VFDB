@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=69", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vfdb"
+version = "0.1.0"
+description = "VFDB: embedded DB with CPython extension"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+authors = [{ name = "TG11" }]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "build>=1"]
