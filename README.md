@@ -9,7 +9,7 @@ for project data and experiments.
 - Open and close database files from Python.
 - Persist table metadata in `<db>.meta`.
 - Persist table rows in heap files named `<db_base>__<table>.vfheap`.
-- `CREATE TABLE` with `INT` and `TEXT` columns.
+- `CREATE TABLE` with common PostgreSQL-style scalar type names.
 - `INSERT`, `SELECT *`, `WHERE`, `LIMIT`, `UPDATE`, and `DELETE`.
 - `BEGIN`, `COMMIT`, and `ROLLBACK` with buffered statement replay.
 - `PRAGMA tables;` and `PRAGMA schema <table>;`.
@@ -17,6 +17,18 @@ for project data and experiments.
   `exec`, `executescript`, and simple `?` parameter binding.
 
 ## Quick Start
+
+From a checkout, build the native extension first:
+
+```powershell
+.\build.bat build
+$env:PYTHONPATH = "$PWD\python"
+```
+
+```bash
+bash build.sh build
+export PYTHONPATH="$PWD/python"
+```
 
 ```python
 import vfdb
@@ -26,6 +38,51 @@ with vfdb.connect("projects.vfdb") as db:
     db.exec("INSERT INTO projects VALUES (?, ?);", [1, "VFDB"])
     rows = db.fetchall("SELECT * FROM projects WHERE id = ?;", [1])
     print(rows)
+```
+
+Run the included Python example with:
+
+```powershell
+$env:PYTHONPATH = "$PWD\python"
+.\.wvenv\Scripts\python.exe examples\python_basic.py
+```
+
+```bash
+export PYTHONPATH="$PWD/python"
+$HOME/.cache/vfdb/venv/bin/python examples/python_basic.py
+```
+
+## C API
+
+The C API is SQLite-shaped: open a database, prepare SQL, step rows, read
+columns, finalize the statement, then close the database.
+
+```c
+VFDB *db = NULL;
+vfdb_open("projects.vfdb", &db);
+
+VFDBStmt *st = NULL;
+vfdb_prepare(db, "SELECT * FROM projects;", &st);
+while (vfdb_step(st) == 1) {
+    printf("%lld %s\n",
+           (long long)vfdb_column_int(st, 0),
+           vfdb_column_text(st, 1));
+}
+vfdb_finalize(st);
+
+vfdb_close(db);
+```
+
+The repo includes [examples/c_basic.c](examples/c_basic.c). On WSL/Linux you
+can compile it directly against the core sources:
+
+```bash
+gcc -Iinclude -Isrc \
+  examples/c_basic.c \
+  src/bptree.c src/catalog.c src/exec.c src/fileio.c src/heap.c \
+  src/parser.c src/tx.c src/util.c src/vf_type.c src/vfdb.c src/vfdb_log.c \
+  -o examples/c_basic
+./examples/c_basic
 ```
 
 ## Supported SQL Subset
@@ -44,9 +101,33 @@ PRAGMA tables;
 PRAGMA schema tasks;
 ```
 
+## Type Support
+
+VFDB accepts common PostgreSQL-style scalar type names and aliases. Storage is
+grouped into a few practical classes:
+
+```text
+INT      SMALLINT, INT, INTEGER, BIGINT, SERIAL, BIGSERIAL, INT2/4/8
+REAL     REAL, FLOAT, DOUBLE PRECISION, NUMERIC, DECIMAL, MONEY
+BOOL     BOOL, BOOLEAN
+BYTEA    BYTEA, BLOB, BYTES, BINARY
+TEXT     TEXT, VARCHAR(n), CHARACTER VARYING(n), CHAR(n), NAME, XML
+DATE     DATE
+TIME     TIME, TIME WITH/WITHOUT TIME ZONE
+TIMESTAMP TIMESTAMP, TIMESTAMPTZ, TIMESTAMP WITH/WITHOUT TIME ZONE
+INTERVAL INTERVAL
+JSONB    JSON, JSONB
+UUID     UUID
+INET     INET, CIDR
+MACADDR  MACADDR, MACADDR8
+```
+
+Python returns `INT` as `int`, `REAL` as `float`, `BOOL` as `bool`, `BYTEA` as
+`bytes`, and the date/time/json/uuid/network families as strings for now.
+
 Current limits are intentional and visible: no joins, no indexes in the query
-planner, no NULL values, and only persisted `INT`/`TEXT` values are supported
-by the storage path.
+planner, no NULL values, no arrays/ranges/user-defined types, and no
+PostgreSQL-grade date/time or arbitrary-precision numeric operations yet.
 
 ## Development
 

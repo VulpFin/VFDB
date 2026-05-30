@@ -26,6 +26,12 @@ vf_type vf_type_from_str(const char *s);
 /* Canonical enum → short string name (e.g. VF_T_INT -> "INT") */
 const char *vf_type_to_str(vf_type t);
 
+int vf_type_uses_int(vf_type t);
+int vf_type_uses_real(vf_type t);
+int vf_type_uses_text(vf_type t);
+int vf_type_uses_blob(vf_type t);
+int vf_type_is_numeric(vf_type t);
+
 #ifdef __cplusplus
 }
 #endif

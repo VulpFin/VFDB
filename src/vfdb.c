@@ -19,8 +19,7 @@
 /**
  * VFDB core (MVP+): CREATE TABLE, INSERT, SELECT * [WHERE col = const],
  * PRAGMA tables/schema, SELECT <int>, UPDATE/DELETE, and transaction replay.
- * INT and TEXT only for persisted values for now. Heap-append storage with
- * tombstones for UPDATE/DELETE.
+ * Heap-append storage with tombstones for UPDATE/DELETE.
  */
 
 #include <stdio.h>
@@ -114,7 +113,8 @@ typedef struct
 {
     int has;
     int col_idx; /* which column */
-    int is_int;  /* 1 if INT, 0 if TEXT */
+    int is_int;  /* compatibility flag for integer-like predicates */
+    vf_type value_type;
     int64_t i64; /* int value */
     char *txt;   /* text value (owned by stmt) */
     PredOp op;
@@ -152,6 +152,8 @@ static void skip_opt_semicolon(const char **p);
 static int parse_ident(const char **p, char *out, int outsz);
 static int parse_op(const char **p, PredOp *op);
 static int parse_quoted(const char **p, char *out, int outsz);
+static int parse_type_decl(const char **p, char *out, int outsz);
+static int parse_value_for_type(const char **p, vf_type type, int64_t *out_i64, char **out_txt);
 static int parse_where_pred(const char **p, const VFTable *t, Predicate *out);
 
 /* used in apply_delete_where_eq() and apply_update_set_eq_where_eq() */
@@ -277,6 +279,183 @@ static int parse_quoted(const char **p, char *out, int outsz)
     s++; /* skip closing quote */
     *p = s;
     return 1;
+}
+
+static int parse_type_decl(const char **p, char *out, int outsz)
+{
+    const char *s = *p;
+    int depth = 0;
+    int i = 0;
+
+    skip_ws(&s);
+    while (*s)
+    {
+        if (*s == '(')
+            depth++;
+        else if (*s == ')')
+        {
+            if (depth == 0)
+                break;
+            depth--;
+        }
+        else if (*s == ',' && depth == 0)
+            break;
+
+        if (i + 1 < outsz)
+            out[i++] = *s;
+        s++;
+    }
+
+    while (i > 0 && isspace((unsigned char)out[i - 1]))
+        i--;
+    out[i] = 0;
+    *p = s;
+    return i > 0;
+}
+
+static int64_t real_to_bits(double value)
+{
+    int64_t bits = 0;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+static double bits_to_real(int64_t bits)
+{
+    double value = 0.0;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static int parse_int_literal(const char **p, int64_t *out)
+{
+    const char *s = *p;
+    int sign = 1;
+    if (*s == '+' || *s == '-')
+    {
+        if (*s == '-')
+            sign = -1;
+        s++;
+    }
+    if (!isdigit((unsigned char)*s))
+        return 0;
+    long long v = 0;
+    while (isdigit((unsigned char)*s))
+    {
+        v = v * 10 + (*s - '0');
+        s++;
+    }
+    *out = sign * v;
+    *p = s;
+    return 1;
+}
+
+static int parse_real_literal(const char **p, int64_t *out_bits)
+{
+    char *end = NULL;
+    double v = strtod(*p, &end);
+    if (end == *p)
+        return 0;
+    *out_bits = real_to_bits(v);
+    *p = end;
+    return 1;
+}
+
+static int parse_bool_literal(const char **p, int64_t *out)
+{
+    const char *s = *p;
+    if (!strncasecmp(s, "TRUE", 4) && !isalnum((unsigned char)s[4]) && s[4] != '_')
+    {
+        *out = 1;
+        *p = s + 4;
+        return 1;
+    }
+    if (!strncasecmp(s, "FALSE", 5) && !isalnum((unsigned char)s[5]) && s[5] != '_')
+    {
+        *out = 0;
+        *p = s + 5;
+        return 1;
+    }
+    if (*s == '1' || *s == '0')
+    {
+        *out = (*s == '1') ? 1 : 0;
+        *p = s + 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int is_hex_digit_char(char ch)
+{
+    return isdigit((unsigned char)ch) ||
+           (ch >= 'a' && ch <= 'f') ||
+           (ch >= 'A' && ch <= 'F');
+}
+
+static int parse_blob_literal(const char **p, char **out_txt)
+{
+    const char *s = *p;
+    if ((s[0] == 'X' || s[0] == 'x') && s[1] == '\'')
+    {
+        s += 2;
+        const char *start = s;
+        while (*s && *s != '\'')
+        {
+            if (!is_hex_digit_char(*s))
+                return 0;
+            s++;
+        }
+        if (*s != '\'' || ((s - start) % 2) != 0)
+            return 0;
+        size_t len = (size_t)(s - start);
+        char *hex = (char *)malloc(len + 1);
+        if (!hex)
+            return 0;
+        memcpy(hex, start, len);
+        hex[len] = 0;
+        *out_txt = hex;
+        *p = s + 1;
+        return 1;
+    }
+
+    char buf[1024];
+    if (!parse_quoted(&s, buf, sizeof buf))
+        return 0;
+
+    size_t len = strlen(buf);
+    char *hex = (char *)malloc(len * 2 + 1);
+    if (!hex)
+        return 0;
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++)
+    {
+        unsigned char ch = (unsigned char)buf[i];
+        hex[i * 2] = digits[ch >> 4];
+        hex[i * 2 + 1] = digits[ch & 0x0F];
+    }
+    hex[len * 2] = 0;
+    *out_txt = hex;
+    *p = s;
+    return 1;
+}
+
+static int parse_value_for_type(const char **p, vf_type type, int64_t *out_i64, char **out_txt)
+{
+    skip_ws(p);
+    if (vf_type_uses_int(type) && type != VF_T_BOOL)
+        return parse_int_literal(p, out_i64);
+    if (vf_type_uses_real(type))
+        return parse_real_literal(p, out_i64);
+    if (type == VF_T_BOOL)
+        return parse_bool_literal(p, out_i64);
+    if (vf_type_uses_blob(type))
+        return parse_blob_literal(p, out_txt);
+
+    char buf[1024];
+    if (!parse_quoted(p, buf, sizeof buf))
+        return 0;
+    *out_txt = vfdb_strdup(buf);
+    return *out_txt != NULL;
 }
 
 /* SELECT <int> parser */
@@ -409,7 +588,7 @@ static int apply_delete_where_eq(VFDB *db, int tidx, Predicate *pred)
         if (flags & VF_ROW_TOMBSTONE)
         {
             for (int i = 0; i < t->ncols; i++)
-                if (t->cols[i].type == VF_T_TEXT)
+                if (vf_type_uses_text(t->cols[i].type))
                 {
                     free(txts[i]);
                     txts[i] = NULL;
@@ -428,7 +607,7 @@ static int apply_delete_where_eq(VFDB *db, int tidx, Predicate *pred)
             changed++;
         }
         for (int i = 0; i < t->ncols; i++)
-            if (t->cols[i].type == VF_T_TEXT)
+            if (vf_type_uses_text(t->cols[i].type))
             {
                 free(txts[i]);
                 txts[i] = NULL;
@@ -445,6 +624,7 @@ typedef struct
 {
     int col_idx;
     int is_int;
+    vf_type value_type;
     int64_t i64;
     char *txt;
 } SetOne;
@@ -489,7 +669,7 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
         if (flags & VF_ROW_TOMBSTONE)
         {
             for (int i = 0; i < t->ncols; i++)
-                if (t->cols[i].type == VF_T_TEXT && txts[i])
+                if (vf_type_uses_text(t->cols[i].type) && txts[i])
                 {
                     free(txts[i]);
                     txts[i] = NULL;
@@ -504,7 +684,7 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
         if (!match)
         {
             for (int i = 0; i < t->ncols; i++)
-                if (t->cols[i].type == VF_T_TEXT && txts[i])
+                if (vf_type_uses_text(t->cols[i].type) && txts[i])
                 {
                     free(txts[i]);
                     txts[i] = NULL;
@@ -523,7 +703,7 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
         hits[nhits].txts = (char **)calloc(t->ncols, sizeof(char *));
         for (int i = 0; i < t->ncols; i++)
         {
-            if (t->cols[i].type == VF_T_INT)
+            if (!vf_type_uses_text(t->cols[i].type))
             {
                 hits[nhits].ints[i] = ints[i];
             }
@@ -536,7 +716,7 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
 
         /* release current scan row's TEXT buffers */
         for (int i = 0; i < t->ncols; i++)
-            if (t->cols[i].type == VF_T_TEXT && txts[i])
+            if (vf_type_uses_text(t->cols[i].type) && txts[i])
             {
                 free(txts[i]);
                 txts[i] = NULL;
@@ -555,14 +735,14 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
         char **u_txts = (char **)calloc(t->ncols, sizeof(char *));
         for (int i = 0; i < t->ncols; i++)
         {
-            if (t->cols[i].type == VF_T_INT)
+            if (!vf_type_uses_text(t->cols[i].type))
                 u_ints[i] = hits[k].ints[i];
             else
                 u_txts[i] = hits[k].txts[i] ? vfdb_strdup(hits[k].txts[i]) : vfdb_strdup("");
         }
 
         /* apply SET */
-        if (set->is_int)
+        if (!vf_type_uses_text(set->value_type))
         {
             u_ints[set->col_idx] = set->i64;
         }
@@ -580,13 +760,13 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
 
         /* cleanup */
         for (int i = 0; i < t->ncols; i++)
-            if (t->cols[i].type == VF_T_TEXT && u_txts[i])
+            if (vf_type_uses_text(t->cols[i].type) && u_txts[i])
                 free(u_txts[i]);
         free(u_txts);
         free(u_ints);
 
         for (int i = 0; i < t->ncols; i++)
-            if (t->cols[i].type == VF_T_TEXT && hits[k].txts[i])
+            if (vf_type_uses_text(t->cols[i].type) && hits[k].txts[i])
                 free(hits[k].txts[i]);
         free(hits[k].txts);
         free(hits[k].ints);
@@ -652,10 +832,10 @@ static int parse_where_pred(const char **p, const VFTable *t, Predicate *out)
         return -1;
     }
 
-    /* TEXT columns only allow = and != */
-    if (t->cols[col].type == VF_T_TEXT && !(op == OP_EQ || op == OP_NE))
+    /* Non-numeric values only allow = and != for now. */
+    if (!vf_type_is_numeric(t->cols[col].type) && !(op == OP_EQ || op == OP_NE))
     {
-        LOG_DEBUG("WHERE invalid op for TEXT column '%s'", cname);
+        LOG_DEBUG("WHERE invalid op for non-numeric column '%s'", cname);
         return -1;
     }
 
@@ -667,39 +847,12 @@ static int parse_where_pred(const char **p, const VFTable *t, Predicate *out)
     pred.op = op;
 
     /* constant */
-    if (t->cols[col].type == VF_T_INT)
+    pred.value_type = t->cols[col].type;
+    pred.is_int = vf_type_uses_int(pred.value_type);
+    if (!parse_value_for_type(&s, pred.value_type, &pred.i64, &pred.txt))
     {
-        int sign = 1;
-        if (*s == '+' || *s == '-')
-        {
-            if (*s == '-')
-                sign = -1;
-            s++;
-        }
-        if (!isdigit((unsigned char)*s))
-        {
-            DUMP_TAIL("WHERE int const missing digits at", s);
-            return -1;
-        }
-        long long v = 0;
-        while (isdigit((unsigned char)*s))
-        {
-            v = v * 10 + (*s - '0');
-            s++;
-        }
-        pred.is_int = 1;
-        pred.i64 = sign * v;
-    }
-    else
-    {
-        char buf[1024];
-        if (!parse_quoted(&s, buf, sizeof buf))
-        {
-            DUMP_TAIL("WHERE text const parse failed at", s);
-            return -1;
-        }
-        pred.is_int = 0;
-        pred.txt = vfdb_strdup(buf);
+        DUMP_TAIL("WHERE const parse failed at", s);
+        return -1;
     }
 
     *p = s;
@@ -858,7 +1011,7 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
         return VFDB_ERR;
     }
 
-    /* CREATE TABLE name (col type,...)  -- INT | TEXT only (MVP) */
+    /* CREATE TABLE name (col type,...) */
     if (!strncasecmp(p, "CREATE TABLE", 12))
     {
         p += 12;
@@ -884,18 +1037,10 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
                 return VFDB_ERR;
             while (isspace((unsigned char)*p))
                 p++;
-            if (!strncasecmp(p, "INT", 3))
-            {
-                cols[ncols].type = VF_T_INT;
-                p += 3;
-            }
-            else if (!strncasecmp(p, "TEXT", 4))
-            {
-                cols[ncols].type = VF_T_TEXT;
-                p += 4;
-            }
-            else
+            char type_decl[128];
+            if (!parse_type_decl(&p, type_decl, sizeof type_decl))
                 return VFDB_ERR;
+            cols[ncols].type = vf_type_from_str(type_decl);
             cols[ncols].name = vfdb_strdup(cname);
             cols[ncols].param1 = cols[ncols].param2 = cols[ncols].not_null = 0;
             cols[ncols].has_default = 0;
@@ -970,32 +1115,8 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
         {
             while (isspace((unsigned char)*p))
                 p++;
-            if (t->cols[i].type == VF_T_INT)
-            {
-                int sign = 1;
-                if (*p == '+' || *p == '-')
-                {
-                    if (*p == '-')
-                        sign = -1;
-                    p++;
-                }
-                long long v = 0;
-                if (!isdigit((unsigned char)*p))
-                    return VFDB_ERR;
-                while (isdigit((unsigned char)*p))
-                {
-                    v = v * 10 + (*p - '0');
-                    p++;
-                }
-                ints[i] = sign * v;
-            }
-            else
-            {
-                char buf[1024];
-                if (!parse_quoted(&p, buf, sizeof buf))
-                    return VFDB_ERR;
-                texts[i] = vfdb_strdup(buf);
-            }
+            if (!parse_value_for_type(&p, t->cols[i].type, &ints[i], &texts[i]))
+                return VFDB_ERR;
             while (isspace((unsigned char)*p))
                 p++;
             if (i + 1 < t->ncols)
@@ -1139,34 +1260,10 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
 
         SetOne set = {0};
         set.col_idx = scol;
-        if (t->cols[scol].type == VF_T_INT)
-        {
-            int sign = 1;
-            if (*p == '+' || *p == '-')
-            {
-                if (*p == '-')
-                    sign = -1;
-                p++;
-            }
-            long long v = 0;
-            if (!isdigit((unsigned char)*p))
-                return VFDB_ERR;
-            while (isdigit((unsigned char)*p))
-            {
-                v = v * 10 + (*p - '0');
-                p++;
-            }
-            set.is_int = 1;
-            set.i64 = sign * v;
-        }
-        else
-        {
-            char buf[1024];
-            if (!parse_quoted(&p, buf, sizeof buf))
-                return VFDB_ERR;
-            set.is_int = 0;
-            set.txt = vfdb_strdup(buf);
-        }
+        set.value_type = t->cols[scol].type;
+        set.is_int = vf_type_uses_int(set.value_type);
+        if (!parse_value_for_type(&p, set.value_type, &set.i64, &set.txt))
+            return VFDB_ERR;
 
         TRACE();
         DUMP_TAIL("before WHERE", p);
@@ -1315,6 +1412,27 @@ static int int_cmp(int64_t a, int64_t b, PredOp op)
     }
     return 0;
 }
+
+static int real_cmp(double a, double b, PredOp op)
+{
+    switch (op)
+    {
+    case OP_EQ:
+        return a == b;
+    case OP_NE:
+        return a != b;
+    case OP_LT:
+        return a < b;
+    case OP_LE:
+        return a <= b;
+    case OP_GT:
+        return a > b;
+    case OP_GE:
+        return a >= b;
+    }
+    return 0;
+}
+
 static int str_cmp(const char *a, const char *b, PredOp op)
 {
     vfdb_log_init_once();
@@ -1336,15 +1454,21 @@ static int row_matches_pred(VFDBStmt *st)
     if (!st->pred.has)
         return 1;
     int c = st->pred.col_idx;
-    if (st->pred.is_int)
+    if (vf_type_uses_real(st->pred.value_type))
     {
-        if (st->table_ptr->cols[c].type != VF_T_INT)
+        if (!vf_type_uses_real(st->table_ptr->cols[c].type))
+            return 0;
+        return real_cmp(bits_to_real(st->row_ints[c]), bits_to_real(st->pred.i64), st->pred.op);
+    }
+    if (vf_type_uses_int(st->pred.value_type))
+    {
+        if (!vf_type_uses_int(st->table_ptr->cols[c].type))
             return 0;
         return int_cmp(st->row_ints[c], st->pred.i64, st->pred.op);
     }
     else
     {
-        if (st->table_ptr->cols[c].type != VF_T_TEXT)
+        if (!vf_type_uses_text(st->table_ptr->cols[c].type))
             return 0;
         return str_cmp(st->row_texts[c], st->pred.txt, st->pred.op);
     }
@@ -1399,7 +1523,7 @@ int vfdb_step(VFDBStmt *st)
         /* col name */
         st->row_texts[0] = vfdb_strdup(c->name);
         /* type as text */
-        const char *tname = (c->type == VF_T_INT) ? "INT" : "TEXT";
+        const char *tname = vf_type_to_str(c->type);
         st->row_texts[1] = vfdb_strdup(tname);
         st->idx++;
         return 1;
@@ -1416,7 +1540,7 @@ int vfdb_step(VFDBStmt *st)
             /* free previous TEXT cells before loading next row */
             for (int i = 0; i < st->ncols; i++)
             {
-                if (st->table_ptr->cols[i].type == VF_T_TEXT && st->row_texts[i])
+                if (vf_type_uses_text(st->table_ptr->cols[i].type) && st->row_texts[i])
                 {
                     free(st->row_texts[i]);
                     st->row_texts[i] = NULL;
@@ -1494,9 +1618,20 @@ int64_t vfdb_column_int(VFDBStmt *st, int i)
         return 0;
     if (st->kind == STMT_SELECT_CONST_INT && i == 0)
         return st->const_int;
-    if (st->kind == STMT_SELECT_ALL && st->table_ptr->cols[i].type == VF_T_INT)
+    if (st->kind == STMT_SELECT_ALL && vf_type_uses_int(st->table_ptr->cols[i].type))
         return st->row_ints[i];
     return 0;
+}
+
+double vfdb_column_real(VFDBStmt *st, int i)
+{
+    vfdb_log_init_once();
+    LOG_DEBUG("vfdb column real stmt %p", (void*)st);
+    if (!st)
+        return 0.0;
+    if (st->kind == STMT_SELECT_ALL && vf_type_uses_real(st->table_ptr->cols[i].type))
+        return bits_to_real(st->row_ints[i]);
+    return 0.0;
 }
 
 const char *vfdb_column_text(VFDBStmt *st, int i)
@@ -1506,7 +1641,7 @@ const char *vfdb_column_text(VFDBStmt *st, int i)
     //LOG_DEBUG("*vfdb column text int %p", (void*)i);
     if (!st)
         return NULL;
-    if (st->kind == STMT_SELECT_ALL && st->table_ptr->cols[i].type == VF_T_TEXT)
+    if (st->kind == STMT_SELECT_ALL && vf_type_uses_text(st->table_ptr->cols[i].type))
         return st->row_texts[i];
     if (st->kind == STMT_PRAGMA_SCHEMA)
         return st->row_texts[i];
@@ -1527,7 +1662,7 @@ void vfdb_finalize(VFDBStmt *st)
         {
             for (int i = 0; i < st->ncols; i++)
             {
-                if (st->table_ptr && st->table_ptr->cols[i].type == VF_T_TEXT && st->row_texts[i])
+                if (st->table_ptr && vf_type_uses_text(st->table_ptr->cols[i].type) && st->row_texts[i])
                 {
                     free(st->row_texts[i]);
                 }
@@ -1554,6 +1689,38 @@ void vfdb_finalize(VFDBStmt *st)
     free(st);
 }
 
+static vfdb_rc vfdb_exec_no_result(VFDB *db, const char *sql)
+{
+    VFDBStmt *st = NULL;
+    vfdb_rc rc = vfdb_prepare(db, sql, &st);
+    if (rc != VFDB_OK)
+        return rc;
+
+    int step_rc = 0;
+    while ((step_rc = vfdb_step(st)) == 1)
+    {
+        /* Transaction control statements should not produce rows. */
+    }
+    vfdb_finalize(st);
+
+    return step_rc < 0 ? VFDB_ERR : VFDB_OK;
+}
+
+vfdb_rc vfdb_begin(VFDB *db)
+{
+    return vfdb_exec_no_result(db, "BEGIN;");
+}
+
+vfdb_rc vfdb_commit(VFDB *db)
+{
+    return vfdb_exec_no_result(db, "COMMIT;");
+}
+
+vfdb_rc vfdb_rollback(VFDB *db)
+{
+    return vfdb_exec_no_result(db, "ROLLBACK;");
+}
+
 static int pred_match_row(const VFTable *t, Predicate *pred, int64_t *ints, char **txts)
 {
     vfdb_log_init_once();
@@ -1564,15 +1731,21 @@ static int pred_match_row(const VFTable *t, Predicate *pred, int64_t *ints, char
     if (!pred || !pred->has)
         return 1;
     int c = pred->col_idx;
-    if (pred->is_int)
+    if (vf_type_uses_real(pred->value_type))
     {
-        if (t->cols[c].type != VF_T_INT)
+        if (!vf_type_uses_real(t->cols[c].type))
+            return 0;
+        return real_cmp(bits_to_real(ints[c]), bits_to_real(pred->i64), pred->op);
+    }
+    if (vf_type_uses_int(pred->value_type))
+    {
+        if (!vf_type_uses_int(t->cols[c].type))
             return 0;
         return int_cmp(ints[c], pred->i64, pred->op);
     }
     else
     {
-        if (t->cols[c].type != VF_T_TEXT)
+        if (!vf_type_uses_text(t->cols[c].type))
             return 0;
         return str_cmp(txts[c] ? txts[c] : "", pred->txt ? pred->txt : "", pred->op);
     }

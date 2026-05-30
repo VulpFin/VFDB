@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "catalog.h"
+#include "vf_type.h"
 
 /* Row flags */
 #define VF_ROW_TOMBSTONE 0x01
@@ -27,7 +28,7 @@ typedef struct
     FILE *fp;
 } HeapScan;
 
-/* Append one row (values as string/int). texts[i] may be NULL for INT cols */
+/* Append one row. ints carries INT/BOOL values and REAL bit patterns. */
 int heap_append_row(const VFTable *t, const int64_t *ints, const char *const *texts);
 
 /* Open a scan over table heap */
@@ -59,7 +60,7 @@ static inline int heap_scan_next(const VFTable *t, HeapScan *sc,
             return 1; /* live row */
         /* free text cells for tombstoned rows before skipping */
         for (int i = 0; i < t->ncols; i++)
-            if (t->cols[i].type == VF_T_TEXT && texts_out[i])
+            if (vf_type_uses_text(t->cols[i].type) && texts_out[i])
             {
                 free(texts_out[i]);
                 texts_out[i] = NULL;

@@ -29,7 +29,9 @@ def _sql_literal(value):
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        raise VFDBError("VFDB does not support REAL values yet")
+        return repr(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "X'" + bytes(value).hex() + "'"
     return "'" + str(value).replace("'", "''") + "'"
 
 

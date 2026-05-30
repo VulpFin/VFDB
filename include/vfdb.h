@@ -38,6 +38,14 @@ extern "C"
         VF_T_BOOL       = 4,
         VF_T_BLOB       = 5,
         VF_T_DATETIME   = 6,
+        VF_T_DATE       = 7,
+        VF_T_TIME       = 8,
+        VF_T_TIMESTAMP  = 9,
+        VF_T_INTERVAL   = 10,
+        VF_T_JSON       = 11,
+        VF_T_UUID       = 12,
+        VF_T_INET       = 13,
+        VF_T_MACADDR    = 14,
     } vf_type;
 
     /* Open/close */
@@ -48,6 +56,7 @@ extern "C"
     vfdb_rc     vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt);
     int         vfdb_step(VFDBStmt *st); /* 1=row, 0=done, <0=err */
     int64_t     vfdb_column_int(VFDBStmt *st, int i);
+    double      vfdb_column_real(VFDBStmt *st, int i);
     const char* vfdb_column_text(VFDBStmt *st, int i);
     int         vfdb_column_count(VFDBStmt *st);
     vf_type     vfdb_column_type(VFDBStmt *st, int i);

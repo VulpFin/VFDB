@@ -18,11 +18,47 @@
 /* python/vfdb/_native.c - minimal working CPython C-extension wrapper */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <string.h>
 #include "vfdb.h"
 #include "vfdb_log.h"
 
 static const char *CAPSULE_DB = "VFDB*";
 static const char *CAPSULE_ST = "VFDBStmt*";
+
+static int hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9')
+        return ch - '0';
+    if (ch >= 'a' && ch <= 'f')
+        return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F')
+        return ch - 'A' + 10;
+    return -1;
+}
+
+static PyObject *bytes_from_hex(const char *hex)
+{
+    Py_ssize_t hex_len = hex ? (Py_ssize_t)strlen(hex) : 0;
+    if ((hex_len % 2) != 0)
+        return PyBytes_FromStringAndSize("", 0);
+
+    PyObject *out = PyBytes_FromStringAndSize(NULL, hex_len / 2);
+    if (!out)
+        return NULL;
+    char *buf = PyBytes_AS_STRING(out);
+    for (Py_ssize_t i = 0; i < hex_len; i += 2)
+    {
+        int hi = hex_value(hex[i]);
+        int lo = hex_value(hex[i + 1]);
+        if (hi < 0 || lo < 0)
+        {
+            Py_DECREF(out);
+            return PyBytes_FromStringAndSize("", 0);
+        }
+        buf[i / 2] = (char)((hi << 4) | lo);
+    }
+    return out;
+}
 
 static void db_capsule_destructor(PyObject *capsule)
 {
@@ -130,6 +166,21 @@ static PyObject *py_step(PyObject *self, PyObject *args)
         if (t == VF_T_INT)
         {
             PyTuple_SET_ITEM(row, i, PyLong_FromLongLong(vfdb_column_int(st, i)));
+        }
+        else if (t == VF_T_BOOL)
+        {
+            PyObject *b = vfdb_column_int(st, i) ? Py_True : Py_False;
+            Py_INCREF(b);
+            PyTuple_SET_ITEM(row, i, b);
+        }
+        else if (t == VF_T_REAL)
+        {
+            PyTuple_SET_ITEM(row, i, PyFloat_FromDouble(vfdb_column_real(st, i)));
+        }
+        else if (t == VF_T_BLOB)
+        {
+            const char *s = vfdb_column_text(st, i);
+            PyTuple_SET_ITEM(row, i, bytes_from_hex(s ? s : ""));
         }
         else
         {

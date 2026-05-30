@@ -15,13 +15,14 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// src/heap.c  (simple: [ncols:u16][nullmap:u16][col..]; INT=tag 1 + varint; TEXT=tag 2 + u32len + bytes)
+// src/heap.c  (simple: [flags][ncols:u16][nullmap:u16][col..])
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "heap.h"
 #include "vfdb.h"
 #include "vfdb_log.h"
+#include "vf_type.h"
 
 static void write_u16(FILE *fp, unsigned v)
 {
@@ -77,9 +78,9 @@ int heap_append_row(const VFTable *t, const int64_t *ints, const char *const *te
     write_u16(fp, 0); /* nullmap MVP = 0 (no NULLs) */
     for (int i = 0; i < t->ncols; i++)
     {
-        if (t->cols[i].type == VF_T_INT)
+        if (vf_type_uses_int(t->cols[i].type) || vf_type_uses_real(t->cols[i].type))
         {
-            /* fixed 8 bytes int64 */
+            /* fixed 8 bytes int64, bool, or double bit pattern */
             unsigned lo = (unsigned)(ints[i] & 0xFFFFFFFFu);
             unsigned hi = (unsigned)((uint64_t)ints[i] >> 32);
             write_u32(fp, lo);
@@ -136,7 +137,7 @@ int heap_scan_next_ex(const VFTable *t, HeapScan *sc,
 
     for (unsigned i = 0; i < ncols; i++)
     {
-        if (t->cols[i].type == VF_T_INT)
+        if (vf_type_uses_int(t->cols[i].type) || vf_type_uses_real(t->cols[i].type))
         {
             unsigned lo = 0, hi = 0;
             if (!read_u32(sc->fp, &lo) || !read_u32(sc->fp, &hi))

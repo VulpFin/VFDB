@@ -38,6 +38,7 @@ tmp/
 *.ilk
 *.exe
 *.a
+examples/c_basic
 
 # VFDB runtime data
 *.vfdb
