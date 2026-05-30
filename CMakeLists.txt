@@ -35,6 +35,7 @@ set(VFDB_CORE_SOURCES
     src/util.c
     src/vf_type.c
     src/vfdb_log.c
+    src/predicate.c
     src/vfdb.c
 )
 

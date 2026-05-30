@@ -33,6 +33,7 @@
 #include "vfdb_log.h"
 #include "compat_layer.h"
 #include "vf_type.h"
+#include "predicate.h"
 #define DUMP_TAIL(tag, p) vfdb_dump_tail((tag), (p), 60)
 
 /* ----- Engine handles ----- */
@@ -43,16 +44,6 @@ typedef enum
     TX_NONE = 0,
     TX_ACTIVE = 1
 } TxState;
-
-typedef enum
-{
-    OP_EQ = 0,
-    OP_NE,
-    OP_LT,
-    OP_LE,
-    OP_GT,
-    OP_GE
-} PredOp;
 
 typedef struct
 {
@@ -108,18 +99,6 @@ typedef enum
     STMT_PRAGMA_SCHEMA
 } StmtKind;
 
-/* simple predicate: WHERE col = const (INT or TEXT) */
-typedef struct
-{
-    int has;
-    int col_idx; /* which column */
-    int is_int;  /* compatibility flag for integer-like predicates */
-    vf_type value_type;
-    int64_t i64; /* int value */
-    char *txt;   /* text value (owned by stmt) */
-    PredOp op;
-} Predicate;
-
 struct VFDBStmt
 {
     StmtKind kind;
@@ -150,14 +129,9 @@ struct VFDBStmt
 static void skip_ws(const char **p);
 static void skip_opt_semicolon(const char **p);
 static int parse_ident(const char **p, char *out, int outsz);
-static int parse_op(const char **p, PredOp *op);
 static int parse_quoted(const char **p, char *out, int outsz);
 static int parse_type_decl(const char **p, char *out, int outsz);
 static int parse_value_for_type(const char **p, vf_type type, int64_t *out_i64, char **out_txt);
-static int parse_where_pred(const char **p, const VFTable *t, Predicate *out);
-
-/* used in apply_delete_where_eq() and apply_update_set_eq_where_eq() */
-static int pred_match_row(const VFTable *t, Predicate *pred, int64_t *ints, char **txts);
 
 /* ============================================================
    Small parsing helpers
@@ -182,50 +156,6 @@ static void skip_opt_semicolon(const char **p)
         (*p)++;
         skip_ws(p);
     }
-}
-
-static int parse_op(const char **p, PredOp *op)
-{
-    vfdb_log_init_once();
-    LOG_DEBUG("parse op at %p", (void*)p);
-    LOG_DEBUG("parse op op %p", (void*)op);
-    const char *s = *p;
-    if (s[0] == '!' && s[1] == '=')
-    {
-        *op = OP_NE;
-        s += 2;
-    }
-    else if (s[0] == '<' && s[1] == '=')
-    {
-        *op = OP_LE;
-        s += 2;
-    }
-    else if (s[0] == '>' && s[1] == '=')
-    {
-        *op = OP_GE;
-        s += 2;
-    }
-    else if (s[0] == '=')
-    {
-        *op = OP_EQ;
-        s += 1;
-    }
-    else if (s[0] == '<')
-    {
-        *op = OP_LT;
-        s += 1;
-    }
-    else if (s[0] == '>')
-    {
-        *op = OP_GT;
-        s += 1;
-    }
-    else
-    {
-        return 0;
-    }
-    *p = s;
-    return 1;
 }
 
 static int parse_ident(const char **p, char *out, int outsz)
@@ -595,11 +525,7 @@ static int apply_delete_where_eq(VFDB *db, int tidx, Predicate *pred)
                 }
             continue;
         }
-        int match = 0;
-        if (pred->is_int) 
-            match = pred_match_row(t, pred, ints, txts);
-        else
-            match = pred_match_row(t, pred, ints, txts);
+        int match = pred_match_row(t, pred, ints, txts);
 
         if (match)
         {
@@ -623,7 +549,6 @@ static int apply_delete_where_eq(VFDB *db, int tidx, Predicate *pred)
 typedef struct
 {
     int col_idx;
-    int is_int;
     vf_type value_type;
     int64_t i64;
     char *txt;
@@ -774,91 +699,6 @@ static int apply_update_set_eq_where_eq(VFDB *db, int tidx, SetOne *set, Predica
     free(hits);
 
     return changed;
-}
-
-/* Returns 1 if it parsed a predicate, 0 if no WHERE clause found, <0 on error */
-static int parse_where_pred(const char **p, const VFTable *t, Predicate *out)
-{
-    vfdb_log_init_once();
-    LOG_DEBUG("parse where pred p %p", (void*)p);
-    LOG_DEBUG("parse where pred table %p", (void*)t);
-    LOG_DEBUG("parse where pred out %p", (void*)out);
-    Predicate pred = (Predicate){0};
-    const char *s = *p;
-    skip_ws(&s);
-
-    /* no WHERE => no predicate */
-    if (strncasecmp(s, "WHERE", 5) != 0)
-    {
-        *out = pred;
-        return 0;
-    }
-
-    s += 5;
-    skip_ws(&s);
-    DUMP_TAIL("WHERE tail@col", s);
-
-    /* column */
-    char cname[64];
-    if (!parse_ident(&s, cname, sizeof cname))
-    {
-        DUMP_TAIL("WHERE parse_ident failed at", s);
-        return -1;
-    }
-
-    int col = -1;
-    for (int i = 0; i < t->ncols; i++)
-    {
-        if (t->cols[i].name && !vfdb_stricmp(t->cols[i].name, cname))
-        {
-            col = i;
-            break;
-        }
-    }
-    if (col < 0)
-    {
-        LOG_DEBUG("WHERE unknown column '%s'", cname);
-        return -1;
-    }
-
-    skip_ws(&s);
-    DUMP_TAIL("WHERE tail@op", s);
-
-    /* operator */
-    PredOp op = OP_EQ;
-    if (!parse_op(&s, &op))
-    {
-        DUMP_TAIL("WHERE parse_op failed at", s);
-        return -1;
-    }
-
-    /* Non-numeric values only allow = and != for now. */
-    if (!vf_type_is_numeric(t->cols[col].type) && !(op == OP_EQ || op == OP_NE))
-    {
-        LOG_DEBUG("WHERE invalid op for non-numeric column '%s'", cname);
-        return -1;
-    }
-
-    skip_ws(&s);
-    DUMP_TAIL("WHERE tail@const", s);
-
-    pred.has = 1;
-    pred.col_idx = col;
-    pred.op = op;
-
-    /* constant */
-    pred.value_type = t->cols[col].type;
-    pred.is_int = vf_type_uses_int(pred.value_type);
-    if (!parse_value_for_type(&s, pred.value_type, &pred.i64, &pred.txt))
-    {
-        DUMP_TAIL("WHERE const parse failed at", s);
-        return -1;
-    }
-
-    *p = s;
-    *out = pred;
-    DUMP_TAIL("WHERE done@", s);
-    return 1;
 }
 
 /* ============================================================
@@ -1261,7 +1101,6 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
         SetOne set = {0};
         set.col_idx = scol;
         set.value_type = t->cols[scol].type;
-        set.is_int = vf_type_uses_int(set.value_type);
         if (!parse_value_for_type(&p, set.value_type, &set.i64, &set.txt))
             return VFDB_ERR;
 
@@ -1298,7 +1137,7 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
             (void)apply_update_set_eq_where_eq(db, tidx, &set, pred.has ? &pred : NULL);
         }
 
-        if (!set.is_int && set.txt)
+        if (set.txt)
             free(set.txt);
         if (pred.txt)
             free(pred.txt);
@@ -1387,64 +1226,6 @@ vfdb_rc vfdb_prepare(VFDB *db, const char *vfql, VFDBStmt **out_stmt)
     }
 
     return VFDB_ERR; /* unsupported SQL in this MVP */
-}
-
-static int int_cmp(int64_t a, int64_t b, PredOp op)
-{
-    vfdb_log_init_once();
-    //LOG_DEBUG("int cmp a %p", (void*)a);
-    //LOG_DEBUG("int cmp b %p", (void*)b);
-    //LOG_DEBUG("int cmp op %p", (void*)op);
-    switch (op)
-    {
-    case OP_EQ:
-        return a == b;
-    case OP_NE:
-        return a != b;
-    case OP_LT:
-        return a < b;
-    case OP_LE:
-        return a <= b;
-    case OP_GT:
-        return a > b;
-    case OP_GE:
-        return a >= b;
-    }
-    return 0;
-}
-
-static int real_cmp(double a, double b, PredOp op)
-{
-    switch (op)
-    {
-    case OP_EQ:
-        return a == b;
-    case OP_NE:
-        return a != b;
-    case OP_LT:
-        return a < b;
-    case OP_LE:
-        return a <= b;
-    case OP_GT:
-        return a > b;
-    case OP_GE:
-        return a >= b;
-    }
-    return 0;
-}
-
-static int str_cmp(const char *a, const char *b, PredOp op)
-{
-    vfdb_log_init_once();
-    //LOG_DEBUG("str cmp a %p", (void*)a);
-    //LOG_DEBUG("str cmp b %p", (void*)b);
-    //LOG_DEBUG("str cmp op %p", (void*)op);
-    int eq = (strcmp(a ? a : "", b ? b : "") == 0);
-    if (op == OP_EQ)
-        return eq;
-    if (op == OP_NE)
-        return !eq;
-    return 0; /* others invalid for TEXT */
 }
 
 static int row_matches_pred(VFDBStmt *st)
@@ -1721,32 +1502,4 @@ vfdb_rc vfdb_rollback(VFDB *db)
     return vfdb_exec_no_result(db, "ROLLBACK;");
 }
 
-static int pred_match_row(const VFTable *t, Predicate *pred, int64_t *ints, char **txts)
-{
-    vfdb_log_init_once();
-    LOG_DEBUG("pred match row table %p", (void*)t);
-    LOG_DEBUG("pred match row pred %p", (void*)pred);
-    LOG_DEBUG("pred match row ints %p", (void*)ints);
-    LOG_DEBUG("pred match row txts %p", (void*)txts);
-    if (!pred || !pred->has)
-        return 1;
-    int c = pred->col_idx;
-    if (vf_type_uses_real(pred->value_type))
-    {
-        if (!vf_type_uses_real(t->cols[c].type))
-            return 0;
-        return real_cmp(bits_to_real(ints[c]), bits_to_real(pred->i64), pred->op);
-    }
-    if (vf_type_uses_int(pred->value_type))
-    {
-        if (!vf_type_uses_int(t->cols[c].type))
-            return 0;
-        return int_cmp(ints[c], pred->i64, pred->op);
-    }
-    else
-    {
-        if (!vf_type_uses_text(t->cols[c].type))
-            return 0;
-        return str_cmp(txts[c] ? txts[c] : "", pred->txt ? pred->txt : "", pred->op);
-    }
-}
+/* pred_match_row moved to predicate.c */
