@@ -56,3 +56,8 @@ int parse_where_pred(const char **p, const VFTable *t, Predicate *out);
  * Used by DELETE and UPDATE paths.
  */
 int pred_match_row(const VFTable *t, Predicate *pred, int64_t *ints, char **txts);
+
+/* Comparison helpers (exported so legacy code in vfdb.c can use them during transition) */
+int int_cmp(int64_t a, int64_t b, PredOp op);
+int real_cmp(double a, double b, PredOp op);
+int str_cmp(const char *a, const char *b, PredOp op);

@@ -30,6 +30,20 @@
 #include "vfdb_log.h"
 #include "vf_type.h"
 
+
+/* Forward declarations for helper functions defined later in this file */
+static void skip_ws(const char **p);
+static int parse_ident(const char **p, char *out, int outsz);
+static int64_t real_to_bits(double value);
+static double bits_to_real(int64_t bits);
+static int parse_int_literal(const char **p, int64_t *out);
+static int parse_real_literal(const char **p, int64_t *out_bits);
+static int parse_bool_literal(const char **p, int64_t *out);
+static int is_hex_digit_char(char ch);
+static int parse_quoted(const char **p, char *out, int outsz);
+static int parse_blob_literal(const char **p, char **out_txt);
+static int parse_value_for_type(const char **p, vf_type type, int64_t *out_i64, char **out_txt);
+
 #define DUMP_TAIL(tag, p) vfdb_dump_tail((tag), (p), 60)
 
 /* ============================================================
@@ -73,7 +87,7 @@ int parse_op(const char **p, PredOp *op)
    Comparison helpers
    ============================================================ */
 
-static int int_cmp(int64_t a, int64_t b, PredOp op)
+int int_cmp(int64_t a, int64_t b, PredOp op)
 {
     switch (op) {
         case OP_EQ: return a == b;
@@ -86,7 +100,7 @@ static int int_cmp(int64_t a, int64_t b, PredOp op)
     return 0;
 }
 
-static int real_cmp(double a, double b, PredOp op)
+int real_cmp(double a, double b, PredOp op)
 {
     switch (op) {
         case OP_EQ: return a == b;
@@ -99,7 +113,7 @@ static int real_cmp(double a, double b, PredOp op)
     return 0;
 }
 
-static int str_cmp(const char *a, const char *b, PredOp op)
+int str_cmp(const char *a, const char *b, PredOp op)
 {
     int eq = (strcmp(a ? a : "", b ? b : "") == 0);
     if (op == OP_EQ) return eq;
@@ -399,35 +413,6 @@ static int parse_blob_literal(const char **p, char **out_txt)
     }
     hex[len * 2] = 0;
     *out_txt = hex;
-    *p = s;
-    return 1;
-}
-{
-    vfdb_log_init_once();
-    LOG_DEBUG("parse quoted at %p", (void*)p);
-    const char *s = *p;
-    if (*s != '\'')
-        return 0;
-    s++;
-    int i = 0;
-    while (*s && i + 1 < outsz)
-    {
-        if (*s == '\'')
-        {
-            if (s[1] == '\'')
-            {
-                out[i++] = '\'';
-                s += 2;
-                continue;
-            }
-            break;
-        }
-        out[i++] = *s++;
-    }
-    if (*s != '\'')
-        return 0;
-    out[i] = 0;
-    s++; /* skip closing quote */
     *p = s;
     return 1;
 }
